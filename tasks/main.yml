@@ -1,0 +1,191 @@
+---
+
+- name: copy the the kubernetes repo
+  copy:
+    src: "kubernetes.repo"
+    dest: "/etc/yum.repos.d/kube.repo"
+    owner: "root"
+    mode: 0755
+
+- name: install yum-utls
+  yum:
+    name: yum-utils.noarch
+    state: present
+
+- name: create docker-ce repo
+  shell: yum-config-manager --add-repo=https://download.docker.com/linux/centos/docker-ce.repo
+
+- name: disable selinux
+  selinux:
+    state: disabled
+
+- name: disable SWAP in fstab 
+  replace:
+    path: /etc/fstab
+    regexp: '^(.+?\sswap\s+swap\s+.*)$'
+    replace: '# \1'
+
+- name: touch k8s.conf for modprobe.d 
+  file:
+    dest: "/etc/modules-load.d/k8s.conf"
+    state: touch
+
+- name: start netfilter for bridging
+  lineinfile:
+    path: "/etc/modules-load.d/k8s.conf"
+    regex: "^br_netfilter"
+    line: "br_netfilter"
+
+- name: rebooting the host
+  reboot:
+  when: node_reboot == true
+
+- name: wait for the machine to come back
+  wait_for:
+    port: 22
+    delay: 10
+
+- name: open firewall ports
+  firewalld:
+    port: "{{ item }}"
+    permanent: yes
+    state: enabled
+  with_items:
+    - 6443/tcp
+    - 2379/tcp
+    - 2380/tcp
+    - 10250/tcp
+    - 10251/tcp
+    - 10252/tcp
+    - 10255/tcp
+    - 6783/tcp
+    - 6783/udp
+    - 6783/udp
+
+- name: touch the k8s.conf in sysctl.d
+  file:
+    dest: "/etc/sysctl.d/k8s.conf"
+    state: touch
+
+- name: ensure sysctl entries
+  sysctl:
+    name: "{{ item }}"
+    value: "1"
+    state: present
+    sysctl_file: "/etc/sysctl.d/k8s.conf"
+    sysctl_set: yes
+  with_items:
+    - net.bridge.bridge-nf-call-iptables
+    - net.bridge.bridge-nf-call-ip6tables
+    - net.ipv6.conf.all.disable_ipv6
+    - net.ipv4.ip_forward
+    
+- name: install the packages
+  yum:
+    name: 
+      - device-mapper-persistent-data
+      - lvm2
+      - kubeadm
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - net-tools
+    state: present
+
+- name: docker config
+  copy: 
+    src: "daemon.json"
+    dest: "/etc/docker/daemon.json"
+    owner: root
+    mode: 0755
+
+- name: make sure the kebernetes services started and star started
+  systemd:
+    name: "{{ item }}"
+    daemon_reload: yes
+    state: started
+    enabled: yes
+  with_items:
+    - docker
+    - kubelet
+
+- name: create the .kube folder
+  file:
+    path: "~/.kube/"
+    state: directory
+
+- name: check to see if the master is initialized
+  shell: kubectl get node
+  ignore_errors: yes
+  register: kubectl
+
+- name: init the master 
+  shell: kubeadm init --pod-network-cidr={{ kube_pod_cidr }} 
+  when: inventory_hostname in groups['bossman'] and kubectl.rc != 0 and kube_pod_network_addon == "flannel"
+
+- name: init the master 
+  shell: kubeadm init
+  when: inventory_hostname in groups['bossman'] and kubectl.rc != 0 and kube_pod_network_addon == "weavenet"
+
+- name: link the k8 configs
+  copy:
+    dest: "~/.kube/config"
+    src: /etc/kubernetes/admin.conf
+    remote_src: yes
+    backup: yes
+  when: inventory_hostname in groups['bossman']
+
+- name: deploy the network (weave Net)
+  shell: kubectl apply -f "https://cloud.weave.works/k8s/net?k8s-version=$(kubectl version | base64 | tr -d '\n')"
+  when: inventory_hostname in groups['bossman'] and kube_pod_network_addon == "weavenet"
+
+- name: deploy the network (Flannel)
+  shell: kubectl apply -f "https://raw.githubusercontent.com/coreos/flannel/62e44c867a2846fefb68bd5f178daf4da3095ccb/Documentation/kube-flannel.yml"
+  when: inventory_hostname in groups['bossman'] and kube_pod_network_addon == "flannel"
+
+- name: deploy the network (Calico)
+  shell: |
+    kubectl apply -f https://docs.projectcalico.org/v3.3/getting-started/kubernetes/installation/hosted/rbac-kdd.yaml
+    kubectl apply -f https://docs.projectcalico.org/v3.3/getting-started/kubernetes/installation/hosted/kubernetes-datastore/calico-networking/1.7/calico.yaml
+  when: inventory_hostname in groups['bossman'] and kube_pod_network_addon == "calico"
+
+- name: get the master token
+  shell: kubeadm token list | awk '$1!="TOKEN" {print $1}'
+  register: mastertoken
+  when: inventory_hostname in groups['bossman']
+
+- name: get the cert path
+  shell: kubeadm config print join-defaults | awk -F":" '$1=="caCertPath" { print $2 }'
+  register: certpath
+  when: inventory_hostname in groups['bossman']
+
+- name: generate the sha key
+  shell: openssl x509 -pubkey -in {{ certpath.stdout }} | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //'
+  register: cacerthash
+  when: inventory_hostname in groups['bossman']
+
+- name: save the master token and hash in fact
+  set_fact:
+    cacerthash: "{{ cacerthash.stdout }}"
+    mastertoken: "{{ mastertoken.stdout }}"
+  when: inventory_hostname in groups['bossman']
+
+- name: wait for master to listen on 6443
+  wait_for:
+    port: 6443
+  when: inventory_hostname in groups['bossman']
+
+- name: let few more minutes before master settle down
+  wait_for: timeout=180
+
+- name: join the minions to the cluster
+  shell: kubeadm join {{ hostvars.kubebossman.ansible_host }}:6443 --token {{ hostvars.kubebossman.mastertoken }} --discovery-token-ca-cert-hash sha256:{{ hostvars.kubebossman.cacerthash }}
+  when: inventory_hostname in groups['minion'] and kubectl.rc != 0
+
+- name: link the k8 configs
+  copy:
+    dest: "~/.kube/config"
+    src: /etc/kubernetes/kubelet.conf
+    remote_src: yes
+    backup: yes
+  when: inventory_hostname in groups['minion']
